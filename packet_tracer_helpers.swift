@@ -18,8 +18,13 @@ struct WindowCandidate {
 
 let expectedActivityWidth = 647.0
 let expectedActivityHeight = 498.0
-let activityBottomTrimRatio = 0.05
-let activityBottomTrimMaxPoints = 24.0
+let minimumActivityCropHeight = 420.0
+let interfaceScanHeightRatio = 0.35
+let interfaceScanHeightMax = 180
+let interfaceRowGapLimit = 3
+let interfaceBlueRatioThreshold = 0.20
+let interfaceDarkRatioThreshold = 0.28
+let interfaceBottomPadding = 12
 
 func runAppleScript(_ script: String) -> String? {
     let process = Process()
@@ -152,6 +157,90 @@ func windowBounds(windowID: Int) -> WindowCandidate? {
     return packetTracerCandidates().first { $0.windowID == windowID }
 }
 
+func activityBottomInsetPixels(for cgImage: CGImage) -> Int {
+    let width = cgImage.width
+    let height = cgImage.height
+    guard width > 0, height > 0 else {
+        return 0
+    }
+
+    let bytesPerPixel = 4
+    let bytesPerRow = width * bytesPerPixel
+    let bitsPerComponent = 8
+    var buffer = [UInt8](repeating: 0, count: height * bytesPerRow)
+
+    guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+          let context = CGContext(
+              data: &buffer,
+              width: width,
+              height: height,
+              bitsPerComponent: bitsPerComponent,
+              bytesPerRow: bytesPerRow,
+              space: colorSpace,
+              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+          ) else {
+        return 0
+    }
+
+    context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+    let startX = max(0, Int(Double(width) * 0.08))
+    let endX = min(width, max(startX + 1, Int(Double(width) * 0.92)))
+    let sampledWidth = endX - startX
+    let scanHeight = min(interfaceScanHeightMax, max(24, Int(Double(height) * interfaceScanHeightRatio)))
+
+    var lastInterfaceRow = -1
+    var gapCount = 0
+
+    for row in 0..<scanHeight {
+        var blueCount = 0
+        var darkCount = 0
+
+        let rowOffset = row * bytesPerRow
+        for x in startX..<endX {
+            let offset = rowOffset + (x * bytesPerPixel)
+            let red = Int(buffer[offset])
+            let green = Int(buffer[offset + 1])
+            let blue = Int(buffer[offset + 2])
+            let alpha = Int(buffer[offset + 3])
+            if alpha < 200 {
+                continue
+            }
+
+            let brightness = red + green + blue
+            if blue >= green + 20 && blue >= red + 35 && blue >= 80 {
+                blueCount += 1
+            }
+            if brightness <= 420 {
+                darkCount += 1
+            }
+        }
+
+        let blueRatio = Double(blueCount) / Double(sampledWidth)
+        let darkRatio = Double(darkCount) / Double(sampledWidth)
+        let interfaceLike = blueRatio >= interfaceBlueRatioThreshold || darkRatio >= interfaceDarkRatioThreshold
+
+        if interfaceLike {
+            lastInterfaceRow = row
+            gapCount = 0
+            continue
+        }
+
+        if lastInterfaceRow >= 0 {
+            gapCount += 1
+            if gapCount > interfaceRowGapLimit {
+                break
+            }
+        }
+    }
+
+    if lastInterfaceRow < 0 {
+        return 0
+    }
+
+    return min(height - 1, lastInterfaceRow + interfaceBottomPadding)
+}
+
 func cropActivityImage(at path: String, windowHeightPoints: Double) throws {
     guard let image = NSImage(contentsOfFile: path),
           let tiff = image.tiffRepresentation,
@@ -167,13 +256,28 @@ func cropActivityImage(at path: String, windowHeightPoints: Double) throws {
     let imageWidth = cgImage.width
     let imageHeight = cgImage.height
     let cropHeightPoints = min(windowHeightPoints, expectedActivityHeight)
-    let bottomTrimPoints = min(
-        activityBottomTrimMaxPoints,
-        max(0.0, cropHeightPoints * activityBottomTrimRatio)
-    )
-    let tightenedCropHeightPoints = max(1.0, cropHeightPoints - bottomTrimPoints)
     let scale = Double(imageHeight) / windowHeightPoints
-    let cropHeightPixels = min(imageHeight, max(1, Int(round(tightenedCropHeightPoints * scale))))
+    let baseCropHeightPixels = min(imageHeight, max(1, Int(round(cropHeightPoints * scale))))
+
+    let baseCropRect = CGRect(
+        x: 0,
+        y: imageHeight - baseCropHeightPixels,
+        width: imageWidth,
+        height: baseCropHeightPixels
+    )
+    guard let baseCropped = cgImage.cropping(to: baseCropRect) else {
+        throw NSError(domain: "packet_tracer_helpers", code: 4, userInfo: [NSLocalizedDescriptionKey: "Unable to crop image at \(path)"])
+    }
+
+    let minimumCropHeightPixels = min(
+        baseCropHeightPixels,
+        max(1, Int(round(minimumActivityCropHeight * scale)))
+    )
+    let detectedBottomInsetPixels = activityBottomInsetPixels(for: baseCropped)
+    let cropHeightPixels = max(
+        minimumCropHeightPixels,
+        baseCropHeightPixels - detectedBottomInsetPixels
+    )
 
     if cropHeightPixels >= imageHeight {
         return
@@ -187,12 +291,12 @@ func cropActivityImage(at path: String, windowHeightPoints: Double) throws {
     )
 
     guard let cropped = cgImage.cropping(to: cropRect) else {
-        throw NSError(domain: "packet_tracer_helpers", code: 4, userInfo: [NSLocalizedDescriptionKey: "Unable to crop image at \(path)"])
+        throw NSError(domain: "packet_tracer_helpers", code: 5, userInfo: [NSLocalizedDescriptionKey: "Unable to crop image at \(path)"])
     }
 
     let outputRep = NSBitmapImageRep(cgImage: cropped)
     guard let pngData = outputRep.representation(using: .png, properties: [:]) else {
-        throw NSError(domain: "packet_tracer_helpers", code: 5, userInfo: [NSLocalizedDescriptionKey: "Unable to encode cropped image at \(path)"])
+        throw NSError(domain: "packet_tracer_helpers", code: 6, userInfo: [NSLocalizedDescriptionKey: "Unable to encode cropped image at \(path)"])
     }
 
     try pngData.write(to: URL(fileURLWithPath: path))
