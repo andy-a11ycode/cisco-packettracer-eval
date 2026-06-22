@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+resolve_tool_dir() {
+  local candidate
+
+  if [[ -n "${PACKET_TRACER_TOOL_DIR:-}" ]]; then
+    candidate="${PACKET_TRACER_TOOL_DIR%/}"
+    if [[ -f "$candidate/packet_tracer_completion.py" && -f "$candidate/packet_tracer_batch.py" && -f "$candidate/packet_tracer_helpers.swift" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+
+  candidate="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$candidate/packet_tracer_completion.py" && -f "$candidate/packet_tracer_batch.py" && -f "$candidate/packet_tracer_helpers.swift" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  candidate="$PWD"
+  while true; do
+    if [[ -f "$candidate/packet_tracer_completion.py" && -f "$candidate/packet_tracer_batch.py" && -f "$candidate/packet_tracer_helpers.swift" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    if [[ "$candidate" == "/" ]]; then
+      break
+    fi
+    candidate="$(dirname "$candidate")"
+  done
+
+  candidate="$HOME/Downloads/Codex CNE2 HUE Test"
+  if [[ -f "$candidate/packet_tracer_completion.py" && -f "$candidate/packet_tracer_batch.py" && -f "$candidate/packet_tracer_helpers.swift" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  return 1
+}
+
+tool_dir="$(resolve_tool_dir)" || {
+  echo "packet-tracer-completion: could not locate packet_tracer_completion.py" >&2
+  echo "Set PACKET_TRACER_TOOL_DIR or keep the launcher next to the Python files." >&2
+  exit 1
+}
+
+if [[ $# -eq 0 ]]; then
+  set -- "$PWD"
+fi
+
+exec python3 "$tool_dir/packet_tracer_completion.py" "$@"
