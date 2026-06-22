@@ -196,7 +196,8 @@ func activityBottomInsetPixels(for cgImage: CGImage) -> Int {
         var blueCount = 0
         var darkCount = 0
 
-        let rowOffset = row * bytesPerRow
+        let sourceRow = (height - 1) - row
+        let rowOffset = sourceRow * bytesPerRow
         for x in startX..<endX {
             let offset = rowOffset + (x * bytesPerPixel)
             let red = Int(buffer[offset])
@@ -261,7 +262,7 @@ func cropActivityImage(at path: String, windowHeightPoints: Double) throws {
 
     let baseCropRect = CGRect(
         x: 0,
-        y: imageHeight - baseCropHeightPixels,
+        y: 0,
         width: imageWidth,
         height: baseCropHeightPixels
     )
@@ -285,7 +286,7 @@ func cropActivityImage(at path: String, windowHeightPoints: Double) throws {
 
     let cropRect = CGRect(
         x: 0,
-        y: imageHeight - cropHeightPixels,
+        y: 0,
         width: imageWidth,
         height: cropHeightPixels
     )
