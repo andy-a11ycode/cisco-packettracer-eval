@@ -7,7 +7,7 @@ For each submission, it:
 1. opens the `.pka` file in Cisco Packet Tracer
 2. captures a screenshot of the `PT Activity` window
 3. reads the `Completion` percentage
-4. reads the line directly below `For instructor use only:`
+4. reads the line directly below `For instructor use only:` when that section exists
 5. writes the result into a CSV file in the submission root folder
 
 ## Important Notes
@@ -17,6 +17,7 @@ For each submission, it:
 - The screenshots must include the lower `Completion` area. The tool now crops the capture to the relevant PT Activity area to reduce OCR noise.
 - You can pass one or more submission root folders to the launcher.
 - If a run was interrupted before, the tool can resume and fill in missing CSV rows or missing screenshots.
+- If you stop the tool with `Ctrl-C`, it exits cleanly, attempts Packet Tracer cleanup, and returns exit code `130`.
 
 ## Requirements
 
@@ -107,14 +108,14 @@ Debug logging includes:
 - detected Packet Tracer windows
 - OCR output lines
 - focused Packet Tracer process cleanup details
-- failures and tracebacks
+- failures and unexpected tracebacks
 
 The tool now also classifies common failures more clearly, for example:
 
 - `Activity window not found`
 - `Screenshot empty or unusable`
 - `OCR failed`
-- `Completion recognized, but instructor metadata missing`
+- `Instructor section present, but no instructor metadata could be parsed`
 - `OCR returned text, but the parser found no usable match`
 - `Wrong window capture suspected`
 
@@ -147,6 +148,20 @@ Name des Studenten;filename;completition;instructor_use_only;duplicate_instructo
 ```
 
 If the same `instructor_use_only` value appears more than once within the same CSV, the column `duplicate_instructor_use_only` is set to `yes` for all affected rows.
+
+Some Packet Tracer activities do not include a `For instructor use only:` section at all. In that case, the tool still records the `Completion` value and leaves `instructor_use_only` empty.
+
+CLI progress output is written as one line per submission, for example:
+
+```text
+[5/50] Birgit Hurer -> Hurer_10.3.5 Packet Tracer - Troubleshoot Default Gateway Issues.pka completion=100 instructor=
+```
+
+If the tool finds a subdirectory that contains files but no `.pka`, it prints a warning with the directory and filenames, for example:
+
+```text
+[warn] CNE1test/some-folder: no .pka files found; files=notes.txt, screenshot.png
+```
 
 ## Files
 

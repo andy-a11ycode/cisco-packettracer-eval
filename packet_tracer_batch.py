@@ -40,6 +40,7 @@ ACTIVITY_WINDOW_TIMEOUT = DEFAULT_ACTIVITY_WINDOW_TIMEOUT
 PACKET_TRACER_EXIT_TIMEOUT = DEFAULT_PACKET_TRACER_EXIT_TIMEOUT
 OCR_TIMEOUT = DEFAULT_OCR_TIMEOUT
 CAPTURE_OCR_TIMEOUT = DEFAULT_CAPTURE_OCR_TIMEOUT
+INTERRUPTED_EXIT_CODE = 130
 LOGGER = logging.getLogger("packet_tracer")
 DEBUG_MODE = False
 DEBUG_LOG_FILE: Optional[Path] = None
@@ -73,7 +74,7 @@ class OCRParseError(PacketTracerDiagnosticError):
 
 
 class InstructorMissingError(PacketTracerDiagnosticError):
-    category = "Completion recognized, but instructor metadata missing"
+    category = "Instructor section present, but no instructor metadata could be parsed"
 
 
 class WrongWindowCaptureError(PacketTracerDiagnosticError):
@@ -391,6 +392,30 @@ def wait_for_packet_tracer_exit(timeout: Optional[float] = None) -> None:
         time.sleep(0.5)
 
 
+def best_effort_cleanup_packet_tracer(context: str) -> None:
+    if DEBUG_MODE:
+        LOGGER.debug("cleanup_packet_tracer context=%s", context)
+
+    try:
+        kill_packet_tracer()
+    except KeyboardInterrupt:
+        if DEBUG_MODE:
+            LOGGER.debug("cleanup_interrupted context=%s stage=kill", context)
+        return
+    except Exception:
+        if DEBUG_MODE:
+            LOGGER.exception("cleanup_kill_failed context=%s", context)
+
+    try:
+        wait_for_packet_tracer_exit()
+    except KeyboardInterrupt:
+        if DEBUG_MODE:
+            LOGGER.debug("cleanup_interrupted context=%s stage=wait", context)
+    except Exception:
+        if DEBUG_MODE:
+            LOGGER.exception("cleanup_wait_failed context=%s", context)
+
+
 def safe_stem(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_")
 
@@ -535,7 +560,33 @@ def expected_screenshot_path(pka_path: Path, pka_files_in_folder: Sequence[Path]
 def row_is_complete(row: Optional[List[str]]) -> bool:
     if not row:
         return False
-    return bool(row[2].strip() and row[3].strip())
+    return bool(row[2].strip())
+
+
+def submission_cli_prefix(index: int, total: int, student_name: str, filename: str) -> str:
+    return f"[{index}/{total}] {student_name} -> {filename}"
+
+
+def format_submission_result(completion: str, instructor: str) -> str:
+    return f"completion={completion} instructor={instructor}"
+
+
+def warn_for_non_pka_directories(root: Path) -> None:
+    for directory in sorted(path for path in root.rglob("*") if path.is_dir()):
+        files = sorted(path.name for path in directory.iterdir() if path.is_file())
+        if not files:
+            continue
+        if any(name.lower().endswith(".pka") for name in files):
+            continue
+
+        preview = ", ".join(files[:5])
+        if len(files) > 5:
+            preview += f", ... ({len(files)} files)"
+        relative_dir = directory.relative_to(root)
+        print(
+            f"[warn] {root.name}/{relative_dir}: no .pka files found; files={preview}",
+            file=sys.stderr,
+        )
 
 
 def open_pka_in_packet_tracer(pka_path: Path, attempt: int = 1) -> None:
@@ -688,7 +739,7 @@ def detect_wrong_capture(lines: Sequence[str]) -> None:
         )
 
 
-def parse_ocr_lines(lines: List[str]) -> Tuple[Optional[str], Optional[str]]:
+def parse_ocr_lines(lines: List[str]) -> Tuple[Optional[str], Optional[str], bool]:
     normalized = [normalize_ocr_line(line) for line in lines if line.strip()]
 
     completion = None
@@ -703,6 +754,7 @@ def parse_ocr_lines(lines: List[str]) -> Tuple[Optional[str], Optional[str]]:
             break
 
     instructor = None
+    has_instructor_section = False
     stop_prefixes = (
         "Time Elapsed",
         "Completion:",
@@ -720,6 +772,7 @@ def parse_ocr_lines(lines: List[str]) -> Tuple[Optional[str], Optional[str]]:
         if "for instructor use" not in line.lower():
             continue
 
+        has_instructor_section = True
         for follow in normalized[index + 1 :]:
             if not follow:
                 continue
@@ -733,12 +786,12 @@ def parse_ocr_lines(lines: List[str]) -> Tuple[Optional[str], Optional[str]]:
 
         break
 
-    return completion, instructor
+    return completion, instructor, has_instructor_section
 
 
 def parse_activity_data(lines: List[str]) -> Tuple[str, str]:
     detect_wrong_capture(lines)
-    completion, instructor = parse_ocr_lines(lines)
+    completion, instructor, has_instructor_section = parse_ocr_lines(lines)
     normalized = [normalize_ocr_line(line) for line in lines if line.strip()]
 
     if not normalized:
@@ -747,9 +800,13 @@ def parse_activity_data(lines: List[str]) -> Tuple[str, str]:
     if completion and instructor:
         return completion, instructor
 
-    if completion and not instructor:
+    if completion and not has_instructor_section:
+        return completion, ""
+
+    if completion and has_instructor_section and not instructor:
         raise InstructorMissingError(
-            f"recognized completion value {completion}, but no instructor metadata below 'For instructor use only:'"
+            "recognized completion value "
+            f"{completion}, but the instructor section was present and no usable metadata could be parsed"
         )
 
     sample = " | ".join(normalized[:5])
@@ -861,6 +918,7 @@ def legacy_screenshot_name_for_folder(pka_files: List[Path], pka_path: Path) -> 
 
 def process_root(root: Path) -> bool:
     pka_files = sorted(root.rglob("*.pka"))
+    warn_for_non_pka_directories(root)
     if not pka_files:
         print(f"[skip] no .pka files in {root.name}")
         return False
@@ -887,8 +945,8 @@ def process_root(root: Path) -> bool:
         csv_present = existing_row is not None
         screenshot_exists = screenshot_path.exists()
         row_complete = row_is_complete(existing_row)
+        prefix = submission_cli_prefix(index, len(pka_files), student_name, pka_path.name)
 
-        print(f"[{index}/{len(pka_files)}] {student_name} -> {pka_path.name}")
         if DEBUG_MODE:
             LOGGER.debug(
                 "submission_state student=%s file=%s row_complete=%s screenshot_exists=%s screenshot=%s",
@@ -901,6 +959,7 @@ def process_root(root: Path) -> bool:
 
         if row_complete and screenshot_exists:
             output_rows[key] = existing_row  # type: ignore[assignment]
+            print(f"{prefix} already complete")
             if DEBUG_MODE:
                 LOGGER.debug("submission_skipped_complete student=%s file=%s", student_name, pka_path)
             continue
@@ -924,7 +983,7 @@ def process_root(root: Path) -> bool:
                 if DEBUG_MODE:
                     LOGGER.exception("screenshot_recovery_failed student=%s file=%s", student_name, pka_path)
                 print(
-                    f"    screenshot recovery failed for {pka_path.name}: {describe_exception(exc)}",
+                    f"{prefix} screenshot recovery failed: {describe_exception(exc)}",
                     file=sys.stderr,
                 )
                 if existing_row is not None:
@@ -933,13 +992,15 @@ def process_root(root: Path) -> bool:
                     output_rows[key] = [student_name, pka_path.name, "", ""]
                 continue
             finally:
-                if DEBUG_MODE:
-                    LOGGER.debug("killing_packet_tracer after screenshot recovery %s", pka_path.name)
-                kill_packet_tracer()
-                wait_for_packet_tracer_exit()
+                best_effort_cleanup_packet_tracer(
+                    f"screenshot recovery {pka_path.name}"
+                )
 
             output_rows[key] = existing_row  # type: ignore[assignment]
-            print("    screenshot recovered")
+            print(
+                f"{prefix} screenshot recovered "
+                f"{format_submission_result(completion, instructor)}"
+            )
             continue
 
         if screenshot_exists and not row_complete:
@@ -948,13 +1009,13 @@ def process_root(root: Path) -> bool:
             try:
                 completion, instructor, _ = read_activity_data(screenshot_path)
                 output_rows[key] = [student_name, pka_path.name, completion, instructor]
-                print(f"    completion={completion} instructor={instructor}")
+                print(f"{prefix} {format_submission_result(completion, instructor)}")
                 continue
             except Exception as exc:
                 if DEBUG_MODE:
                     LOGGER.exception("ocr_from_existing_screenshot_failed student=%s file=%s", student_name, pka_path)
                 print(
-                    f"    OCR failed for existing screenshot {pka_path.name}: {describe_exception(exc)}",
+                    f"{prefix} OCR failed for existing screenshot: {describe_exception(exc)}",
                     file=sys.stderr,
                 )
                 root_incomplete = True
@@ -977,7 +1038,7 @@ def process_root(root: Path) -> bool:
                 time.sleep(1.5)
                 completion, instructor, _ = capture_and_read_activity_data(window_id, screenshot_path)
                 output_rows[key] = [student_name, pka_path.name, completion, instructor]
-                print(f"    completion={completion} instructor={instructor}")
+                print(f"{prefix} {format_submission_result(completion, instructor)}")
                 success = True
                 break
             except Exception as exc:
@@ -990,14 +1051,13 @@ def process_root(root: Path) -> bool:
                         attempt,
                     )
                 print(
-                    f"    attempt {attempt} failed for {pka_path.name}: {describe_exception(exc)}",
+                    f"{prefix} attempt {attempt} failed: {describe_exception(exc)}",
                     file=sys.stderr,
                 )
             finally:
-                if DEBUG_MODE:
-                    LOGGER.debug("killing_packet_tracer after %s attempt=%s", pka_path.name, attempt)
-                kill_packet_tracer()
-                wait_for_packet_tracer_exit()
+                best_effort_cleanup_packet_tracer(
+                    f"submission {pka_path.name} attempt={attempt}"
+                )
 
             if attempt < SUBMISSION_RETRY_COUNT:
                 time.sleep(3.0)
@@ -1017,7 +1077,7 @@ def process_root(root: Path) -> bool:
                     last_error,
                 )
             print(
-                "    failed after "
+                f"{prefix} failed after "
                 f"{SUBMISSION_RETRY_COUNT} attempts: "
                 f"{describe_exception(last_error) if last_error else 'unknown failure'}",
                 file=sys.stderr,
@@ -1135,6 +1195,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if DEBUG_MODE:
             LOGGER.debug("=== packet-tracer debug session complete incomplete=%s ===", any_incomplete)
         return 2 if any_incomplete else 0
+    except KeyboardInterrupt:
+        if DEBUG_MODE:
+            LOGGER.debug("run interrupted by user")
+        best_effort_cleanup_packet_tracer("user interrupt")
+        print("interrupted by user", file=sys.stderr)
+        return INTERRUPTED_EXIT_CODE
     except Exception as exc:
         if DEBUG_MODE:
             LOGGER.exception("unhandled failure in packet_tracer_batch")
